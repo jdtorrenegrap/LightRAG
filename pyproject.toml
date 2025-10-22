@@ -23,13 +23,12 @@ classifiers = [
 dependencies = [
     "aiohttp",
     "configparser",
-    "dotenv",
     "future",
     "json_repair",
     "nano-vectordb",
     "networkx",
     "numpy",
-    "pandas>=2.0.0,<2.3.0",
+    "pandas>=2.0.0,<2.4.0",
     "pipmaster",
     "pydantic",
     "pypinyin",
@@ -45,14 +44,13 @@ api = [
     # Core dependencies
     "aiohttp",
     "configparser",
-    "dotenv",
     "future",
     "json_repair",
     "nano-vectordb",
     "networkx",
     "numpy",
-    "openai>=1.0.0,<2.0.0",
-    "pandas>=2.0.0,<2.3.0",
+    "openai>=1.0.0,<3.0.0",
+    "pandas>=2.0.0,<2.4.0",
     "pipmaster",
     "pydantic",
     "pypinyin",
@@ -100,7 +98,7 @@ offline-storage = [
 
 offline-llm = [
     # LLM provider dependencies
-    "openai>=1.0.0,<2.0.0",
+    "openai>=1.0.0,<3.0.0",
     "anthropic>=0.18.0,<1.0.0",
     "ollama>=0.1.0,<1.0.0",
     "zhipuai>=2.0.0,<3.0.0",

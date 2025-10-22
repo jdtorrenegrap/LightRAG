@@ -345,14 +345,17 @@ def create_app(args):
             finalize_share_data()
 
     # Initialize FastAPI
+    base_description = (
+        "Providing API for LightRAG core, Web UI and Ollama Model Emulation"
+    )
+    swagger_description = (
+        base_description
+        + (" (API-Key Enabled)" if api_key else "")
+        + "\n\n[View ReDoc documentation](/redoc)"
+    )
     app_kwargs = {
         "title": "LightRAG Server API",
-        "description": (
-            "Providing API for LightRAG core, Web UI and Ollama Model Emulation"
-            + "(With authentication)"
-            if api_key
-            else ""
-        ),
+        "description": swagger_description,
         "version": __api_version__,
         "openapi_url": "/openapi.json",  # Explicitly set OpenAPI schema URL
         "docs_url": "/docs",  # Explicitly set docs URL
@@ -908,7 +911,9 @@ def create_app(args):
         async def get_response(self, path: str, scope):
             response = await super().get_response(path, scope)
 
-            if path.endswith(".html"):
+            is_html = path.endswith(".html") or response.media_type == "text/html"
+
+            if is_html:
                 response.headers["Cache-Control"] = (
                     "no-cache, no-store, must-revalidate"
                 )
