@@ -15,7 +15,6 @@ import logging.config
 import sys
 import uvicorn
 import pipmaster as pm
-import inspect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 from pathlib import Path
@@ -57,7 +56,8 @@ from lightrag.api.routers.ollama_api import OllamaAPI
 from lightrag.utils import logger, set_verbose_debug
 from lightrag.kg.shared_storage import (
     get_namespace_data,
-    initialize_pipeline_status,
+    get_default_workspace,
+    # set_default_workspace,
     cleanup_keyed_lock,
     finalize_share_data,
 )
@@ -89,6 +89,8 @@ class LLMConfigCache:
 
         # Initialize configurations based on binding conditions
         self.openai_llm_options = None
+        self.gemini_llm_options = None
+        self.gemini_embedding_options = None
         self.ollama_llm_options = None
         self.ollama_embedding_options = None
 
@@ -98,6 +100,12 @@ class LLMConfigCache:
 
             self.openai_llm_options = OpenAILLMOptions.options_dict(args)
             logger.info(f"OpenAI LLM Options: {self.openai_llm_options}")
+
+        if args.llm_binding == "gemini":
+            from lightrag.llm.binding_options import GeminiLLMOptions
+
+            self.gemini_llm_options = GeminiLLMOptions.options_dict(args)
+            logger.info(f"Gemini LLM Options: {self.gemini_llm_options}")
 
         # Only initialize and log Ollama LLM options when using Ollama LLM binding
         if args.llm_binding == "ollama":
@@ -128,6 +136,23 @@ class LLMConfigCache:
                     "OllamaEmbeddingOptions not available, using default configuration"
                 )
                 self.ollama_embedding_options = {}
+
+        # Only initialize and log Gemini Embedding options when using Gemini Embedding binding
+        if args.embedding_binding == "gemini":
+            try:
+                from lightrag.llm.binding_options import GeminiEmbeddingOptions
+
+                self.gemini_embedding_options = GeminiEmbeddingOptions.options_dict(
+                    args
+                )
+                logger.info(
+                    f"Gemini Embedding Options: {self.gemini_embedding_options}"
+                )
+            except ImportError:
+                logger.warning(
+                    "GeminiEmbeddingOptions not available, using default configuration"
+                )
+                self.gemini_embedding_options = {}
 
 
 def check_frontend_build():
@@ -279,6 +304,7 @@ def create_app(args):
         "openai",
         "azure_openai",
         "aws_bedrock",
+        "gemini",
     ]:
         raise Exception("llm binding not supported")
 
@@ -289,6 +315,7 @@ def create_app(args):
         "azure_openai",
         "aws_bedrock",
         "jina",
+        "gemini",
     ]:
         raise Exception("embedding binding not supported")
 
@@ -324,8 +351,8 @@ def create_app(args):
 
         try:
             # Initialize database connections
+            # Note: initialize_storages() now auto-initializes pipeline_status for rag.workspace
             await rag.initialize_storages()
-            await initialize_pipeline_status()
 
             # Data migration regardless of storage implementation
             await rag.check_and_migrate_data()
@@ -426,6 +453,28 @@ def create_app(args):
     # Create combined auth dependency for all endpoints
     combined_auth = get_combined_auth_dependency(api_key)
 
+    def get_workspace_from_request(request: Request) -> str | None:
+        """
+        Extract workspace from HTTP request header or use default.
+
+        This enables multi-workspace API support by checking the custom
+        'LIGHTRAG-WORKSPACE' header. If not present, falls back to the
+        server's default workspace configuration.
+
+        Args:
+            request: FastAPI Request object
+
+        Returns:
+            Workspace identifier (may be empty string for global namespace)
+        """
+        # Check custom header first
+        workspace = request.headers.get("LIGHTRAG-WORKSPACE", "").strip()
+
+        if not workspace:
+            workspace = None
+
+        return workspace
+
     # Create working directory if it doesn't exist
     Path(args.working_dir).mkdir(parents=True, exist_ok=True)
 
@@ -504,6 +553,44 @@ def create_app(args):
 
         return optimized_azure_openai_model_complete
 
+    def create_optimized_gemini_llm_func(
+        config_cache: LLMConfigCache, args, llm_timeout: int
+    ):
+        """Create optimized Gemini LLM function with cached configuration"""
+
+        async def optimized_gemini_model_complete(
+            prompt,
+            system_prompt=None,
+            history_messages=None,
+            keyword_extraction=False,
+            **kwargs,
+        ) -> str:
+            from lightrag.llm.gemini import gemini_complete_if_cache
+
+            if history_messages is None:
+                history_messages = []
+
+            # Use pre-processed configuration to avoid repeated parsing
+            kwargs["timeout"] = llm_timeout
+            if (
+                config_cache.gemini_llm_options is not None
+                and "generation_config" not in kwargs
+            ):
+                kwargs["generation_config"] = dict(config_cache.gemini_llm_options)
+
+            return await gemini_complete_if_cache(
+                args.llm_model,
+                prompt,
+                system_prompt=system_prompt,
+                history_messages=history_messages,
+                api_key=args.llm_binding_api_key,
+                base_url=args.llm_binding_host,
+                keyword_extraction=keyword_extraction,
+                **kwargs,
+            )
+
+        return optimized_gemini_model_complete
+
     def create_llm_model_func(binding: str):
         """
         Create LLM model function based on binding type.
@@ -525,6 +612,8 @@ def create_app(args):
                 return create_optimized_azure_openai_llm_func(
                     config_cache, args, llm_timeout
                 )
+            elif binding == "gemini":
+                return create_optimized_gemini_llm_func(config_cache, args, llm_timeout)
             else:  # openai and compatible
                 # Use optimized function with pre-processed configuration
                 return create_optimized_openai_llm_func(config_cache, args, llm_timeout)
@@ -551,34 +640,109 @@ def create_app(args):
         return {}
 
     def create_optimized_embedding_function(
-        config_cache: LLMConfigCache, binding, model, host, api_key, dimensions, args
-    ):
+        config_cache: LLMConfigCache, binding, model, host, api_key, args
+    ) -> EmbeddingFunc:
         """
-        Create optimized embedding function with pre-processed configuration for applicable bindings.
-        Uses lazy imports for all bindings and avoids repeated configuration parsing.
+        Create optimized embedding function and return an EmbeddingFunc instance
+        with proper max_token_size inheritance from provider defaults.
+
+        This function:
+        1. Imports the provider embedding function
+        2. Extracts max_token_size and embedding_dim from provider if it's an EmbeddingFunc
+        3. Creates an optimized wrapper that calls the underlying function directly (avoiding double-wrapping)
+        4. Returns a properly configured EmbeddingFunc instance
         """
 
-        async def optimized_embedding_function(texts):
+        # Step 1: Import provider function and extract default attributes
+        provider_func = None
+        provider_max_token_size = None
+        provider_embedding_dim = None
+
+        try:
+            if binding == "openai":
+                from lightrag.llm.openai import openai_embed
+
+                provider_func = openai_embed
+            elif binding == "ollama":
+                from lightrag.llm.ollama import ollama_embed
+
+                provider_func = ollama_embed
+            elif binding == "gemini":
+                from lightrag.llm.gemini import gemini_embed
+
+                provider_func = gemini_embed
+            elif binding == "jina":
+                from lightrag.llm.jina import jina_embed
+
+                provider_func = jina_embed
+            elif binding == "azure_openai":
+                from lightrag.llm.azure_openai import azure_openai_embed
+
+                provider_func = azure_openai_embed
+            elif binding == "aws_bedrock":
+                from lightrag.llm.bedrock import bedrock_embed
+
+                provider_func = bedrock_embed
+            elif binding == "lollms":
+                from lightrag.llm.lollms import lollms_embed
+
+                provider_func = lollms_embed
+
+            # Extract attributes if provider is an EmbeddingFunc
+            if provider_func and isinstance(provider_func, EmbeddingFunc):
+                provider_max_token_size = provider_func.max_token_size
+                provider_embedding_dim = provider_func.embedding_dim
+                logger.debug(
+                    f"Extracted from {binding} provider: "
+                    f"max_token_size={provider_max_token_size}, "
+                    f"embedding_dim={provider_embedding_dim}"
+                )
+        except ImportError as e:
+            logger.warning(f"Could not import provider function for {binding}: {e}")
+
+        # Step 2: Apply priority (user config > provider default)
+        # For max_token_size: explicit env var > provider default > None
+        final_max_token_size = args.embedding_token_limit or provider_max_token_size
+        # For embedding_dim: user config (always has value) takes priority
+        # Only use provider default if user config is explicitly None (which shouldn't happen)
+        final_embedding_dim = (
+            args.embedding_dim if args.embedding_dim else provider_embedding_dim
+        )
+
+        # Step 3: Create optimized embedding function (calls underlying function directly)
+        async def optimized_embedding_function(texts, embedding_dim=None):
             try:
                 if binding == "lollms":
                     from lightrag.llm.lollms import lollms_embed
 
-                    return await lollms_embed(
+                    # Get real function, skip EmbeddingFunc wrapper if present
+                    actual_func = (
+                        lollms_embed.func
+                        if isinstance(lollms_embed, EmbeddingFunc)
+                        else lollms_embed
+                    )
+                    return await actual_func(
                         texts, embed_model=model, host=host, api_key=api_key
                     )
                 elif binding == "ollama":
                     from lightrag.llm.ollama import ollama_embed
 
-                    # Use pre-processed configuration if available, otherwise fallback to dynamic parsing
+                    # Get real function, skip EmbeddingFunc wrapper if present
+                    actual_func = (
+                        ollama_embed.func
+                        if isinstance(ollama_embed, EmbeddingFunc)
+                        else ollama_embed
+                    )
+
+                    # Use pre-processed configuration if available
                     if config_cache.ollama_embedding_options is not None:
                         ollama_options = config_cache.ollama_embedding_options
                     else:
-                        # Fallback for cases where config cache wasn't initialized properly
                         from lightrag.llm.binding_options import OllamaEmbeddingOptions
 
                         ollama_options = OllamaEmbeddingOptions.options_dict(args)
 
-                    return await ollama_embed(
+                    return await actual_func(
                         texts,
                         embed_model=model,
                         host=host,
@@ -588,27 +752,93 @@ def create_app(args):
                 elif binding == "azure_openai":
                     from lightrag.llm.azure_openai import azure_openai_embed
 
-                    return await azure_openai_embed(texts, model=model, api_key=api_key)
+                    actual_func = (
+                        azure_openai_embed.func
+                        if isinstance(azure_openai_embed, EmbeddingFunc)
+                        else azure_openai_embed
+                    )
+                    return await actual_func(texts, model=model, api_key=api_key)
                 elif binding == "aws_bedrock":
                     from lightrag.llm.bedrock import bedrock_embed
 
-                    return await bedrock_embed(texts, model=model)
+                    actual_func = (
+                        bedrock_embed.func
+                        if isinstance(bedrock_embed, EmbeddingFunc)
+                        else bedrock_embed
+                    )
+                    return await actual_func(texts, model=model)
                 elif binding == "jina":
                     from lightrag.llm.jina import jina_embed
 
-                    return await jina_embed(
-                        texts, dimensions=dimensions, base_url=host, api_key=api_key
+                    actual_func = (
+                        jina_embed.func
+                        if isinstance(jina_embed, EmbeddingFunc)
+                        else jina_embed
+                    )
+                    return await actual_func(
+                        texts,
+                        embedding_dim=embedding_dim,
+                        base_url=host,
+                        api_key=api_key,
+                    )
+                elif binding == "gemini":
+                    from lightrag.llm.gemini import gemini_embed
+
+                    actual_func = (
+                        gemini_embed.func
+                        if isinstance(gemini_embed, EmbeddingFunc)
+                        else gemini_embed
+                    )
+
+                    # Use pre-processed configuration if available
+                    if config_cache.gemini_embedding_options is not None:
+                        gemini_options = config_cache.gemini_embedding_options
+                    else:
+                        from lightrag.llm.binding_options import GeminiEmbeddingOptions
+
+                        gemini_options = GeminiEmbeddingOptions.options_dict(args)
+
+                    return await actual_func(
+                        texts,
+                        model=model,
+                        base_url=host,
+                        api_key=api_key,
+                        embedding_dim=embedding_dim,
+                        task_type=gemini_options.get("task_type", "RETRIEVAL_DOCUMENT"),
                     )
                 else:  # openai and compatible
                     from lightrag.llm.openai import openai_embed
 
-                    return await openai_embed(
-                        texts, model=model, base_url=host, api_key=api_key
+                    actual_func = (
+                        openai_embed.func
+                        if isinstance(openai_embed, EmbeddingFunc)
+                        else openai_embed
+                    )
+                    return await actual_func(
+                        texts,
+                        model=model,
+                        base_url=host,
+                        api_key=api_key,
+                        embedding_dim=embedding_dim,
                     )
             except ImportError as e:
                 raise Exception(f"Failed to import {binding} embedding: {e}")
 
-        return optimized_embedding_function
+        # Step 4: Wrap in EmbeddingFunc and return
+        embedding_func_instance = EmbeddingFunc(
+            embedding_dim=final_embedding_dim,
+            func=optimized_embedding_function,
+            max_token_size=final_max_token_size,
+            send_dimensions=False,  # Will be set later based on binding requirements
+        )
+
+        # Log final embedding configuration
+        logger.info(
+            f"Embedding config: binding={binding} model={model} "
+            f"embedding_dim={final_embedding_dim} max_token_size={final_max_token_size}"
+        )
+
+        return embedding_func_instance
 
     llm_timeout = get_env_value("LLM_TIMEOUT", DEFAULT_LLM_TIMEOUT, int)
     embedding_timeout = get_env_value(
@@ -642,19 +872,62 @@ def create_app(args):
             **kwargs,
         )
 
-    # Create embedding function with optimized configuration
-    embedding_func = EmbeddingFunc(
-        embedding_dim=args.embedding_dim,
-        func=create_optimized_embedding_function(
-            config_cache=config_cache,
-            binding=args.embedding_binding,
-            model=args.embedding_model,
-            host=args.embedding_binding_host,
-            api_key=args.embedding_binding_api_key,
-            dimensions=args.embedding_dim,
-            args=args,  # Pass args object for fallback option generation
-        ),
+    # Create embedding function with optimized configuration and max_token_size inheritance
+    import inspect
+
+    # Create the EmbeddingFunc instance (now returns complete EmbeddingFunc with max_token_size)
+    embedding_func = create_optimized_embedding_function(
+        config_cache=config_cache,
+        binding=args.embedding_binding,
+        model=args.embedding_model,
+        host=args.embedding_binding_host,
+        api_key=args.embedding_binding_api_key,
+        args=args,
     )
+
+    # Get embedding_send_dim from centralized configuration
+    embedding_send_dim = args.embedding_send_dim
+
+    # Check if the underlying function signature has embedding_dim parameter
+    sig = inspect.signature(embedding_func.func)
+    has_embedding_dim_param = "embedding_dim" in sig.parameters
+
+    # Determine send_dimensions value based on binding type
+    # Jina and Gemini REQUIRE dimension parameter (forced to True)
+    # OpenAI and others: controlled by EMBEDDING_SEND_DIM environment variable
+    if args.embedding_binding in ["jina", "gemini"]:
+        # Jina and Gemini APIs require dimension parameter - always send it
+        send_dimensions = has_embedding_dim_param
+        dimension_control = f"forced by {args.embedding_binding.title()} API"
+    else:
+        # For OpenAI and other bindings, respect EMBEDDING_SEND_DIM setting
+        send_dimensions = embedding_send_dim and has_embedding_dim_param
+        if send_dimensions or not embedding_send_dim:
+            dimension_control = "by env var"
+        else:
+            dimension_control = "by not hasparam"
+
+    # Set send_dimensions on the EmbeddingFunc instance
+    embedding_func.send_dimensions = send_dimensions
+
+    logger.info(
+        f"Send embedding dimension: {send_dimensions} {dimension_control} "
+        f"(dimensions={embedding_func.embedding_dim}, has_param={has_embedding_dim_param}, "
+        f"binding={args.embedding_binding})"
+    )
+
+    # Log max_token_size source
+    if embedding_func.max_token_size:
+        source = (
+            "env variable"
+            if args.embedding_token_limit
+            else f"{args.embedding_binding} provider default"
+        )
+        logger.info(
+            f"Embedding max_token_size: {embedding_func.max_token_size} (from {source})"
+        )
+    else:
+        logger.info("Embedding max_token_size: not set (90% token warning disabled)")
 
     # Configure rerank function based on args.rerank_bindingparameter
     rerank_model_func = None
@@ -863,10 +1136,16 @@ def create_app(args):
         }
 
     @app.get("/health", dependencies=[Depends(combined_auth)])
-    async def get_status():
+    async def get_status(request: Request):
         """Get current system status"""
         try:
-            pipeline_status = await get_namespace_data("pipeline_status")
+            workspace = get_workspace_from_request(request)
+            default_workspace = get_default_workspace()
+            if workspace is None:
+                workspace = default_workspace
+            pipeline_status = await get_namespace_data(
+                "pipeline_status", workspace=workspace
+            )
 
             if not auth_configured:
                 auth_mode = "disabled"
@@ -897,7 +1176,7 @@ def create_app(args):
                     "vector_storage": args.vector_storage,
                     "enable_llm_cache_for_extract": args.enable_llm_cache_for_extract,
                     "enable_llm_cache": args.enable_llm_cache,
-                    "workspace": args.workspace,
+                    "workspace": default_workspace,
                     "max_graph_nodes": args.max_graph_nodes,
                     # Rerank configuration
                     "enable_rerank": rerank_model_func is not None,
@@ -1086,6 +1365,12 @@ def check_and_install_dependencies():
 
 
 def main():
+    # Explicitly initialize configuration for clarity
+    # (The proxy will auto-initialize anyway, but this makes intent clear)
+    from .config import initialize_config
+
+    initialize_config()
+
     # Check if running under Gunicorn
     if "GUNICORN_CMD_ARGS" in os.environ:
         # If started with Gunicorn, return directly as Gunicorn will call get_application
