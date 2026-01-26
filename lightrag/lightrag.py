@@ -7,7 +7,7 @@ import inspect
 import os
 import time
 import warnings
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from functools import partial
 from typing import (
@@ -157,8 +157,8 @@ class LightRAG:
     workspace: str = field(default_factory=lambda: os.getenv("WORKSPACE", ""))
     """Workspace for data isolation. Defaults to empty string if WORKSPACE environment variable is not set."""
 
-    # Logging (Deprecated, use setup_logger in utils.py instead)
     # ---
+    # TODO: Deprecated, use setup_logger in utils.py instead
     log_level: int | None = field(default=None)
     log_file_path: str | None = field(default=None)
 
@@ -518,14 +518,9 @@ class LightRAG:
                 f"max_total_tokens({self.summary_max_tokens}) should greater than summary_length_recommended({self.summary_length_recommended})"
             )
 
-        # Fix global_config now
-        global_config = asdict(self)
-
-        _print_config = ",\n  ".join([f"{k} = {v}" for k, v in global_config.items()])
-        logger.debug(f"LightRAG init with param:\n  {_print_config}\n")
-
         # Init Embedding
-        # Step 1: Capture max_token_size before applying decorator (decorator strips dataclass attributes)
+        # Step 1: Capture embedding_func and max_token_size before applying rate_limit decorator
+        original_embedding_func = self.embedding_func
         embedding_max_token_size = None
         if self.embedding_func and hasattr(self.embedding_func, "max_token_size"):
             embedding_max_token_size = self.embedding_func.max_token_size
@@ -534,12 +529,26 @@ class LightRAG:
             )
         self.embedding_token_limit = embedding_max_token_size
 
-        # Step 2: Apply priority wrapper decorator
-        self.embedding_func = priority_limit_async_func_call(
-            self.embedding_func_max_async,
-            llm_timeout=self.default_embedding_timeout,
-            queue_name="Embedding func",
-        )(self.embedding_func)
+        # Fix global_config now
+        global_config = asdict(self)
+        # Restore original EmbeddingFunc object (asdict converts it to dict)
+        global_config["embedding_func"] = original_embedding_func
+
+        _print_config = ",\n  ".join([f"{k} = {v}" for k, v in global_config.items()])
+        logger.debug(f"LightRAG init with param:\n  {_print_config}\n")
+
+        # Step 2: Apply priority wrapper decorator to EmbeddingFunc's inner func
+        # Create a NEW EmbeddingFunc instance with the wrapped func to avoid mutating the caller's object
+        # This ensures _generate_collection_suffix can still access attributes (model_name, embedding_dim)
+        # while preventing side effects when the same EmbeddingFunc is reused across multiple LightRAG instances
+        if self.embedding_func is not None:
+            wrapped_func = priority_limit_async_func_call(
+                self.embedding_func_max_async,
+                llm_timeout=self.default_embedding_timeout,
+                queue_name="Embedding func",
+            )(self.embedding_func.func)
+            # Use dataclasses.replace() to create a new instance, leaving the original unchanged
+            self.embedding_func = replace(self.embedding_func, func=wrapped_func)
 
         # Initialize all storages
         self.key_string_value_json_storage_cls: type[BaseKVStorage] = (
@@ -1352,17 +1361,46 @@ class LightRAG:
         # Exclude IDs of documents that are already enqueued
         unique_new_doc_ids = await self.doc_status.filter_keys(all_new_doc_ids)
 
-        # Log ignored document IDs (documents that were filtered out because they already exist)
+        # Handle duplicate documents - create trackable records with current track_id
         ignored_ids = list(all_new_doc_ids - unique_new_doc_ids)
         if ignored_ids:
+            duplicate_docs: dict[str, Any] = {}
             for doc_id in ignored_ids:
                 file_path = new_docs.get(doc_id, {}).get("file_path", "unknown_source")
-                logger.warning(
-                    f"Ignoring document ID (already exists): {doc_id} ({file_path})"
+                logger.warning(f"Duplicate document detected: {doc_id} ({file_path})")
+
+                # Get existing document info for reference
+                existing_doc = await self.doc_status.get_by_id(doc_id)
+                existing_status = (
+                    existing_doc.get("status", "unknown") if existing_doc else "unknown"
                 )
-            if len(ignored_ids) > 3:
-                logger.warning(
-                    f"Total Ignoring {len(ignored_ids)} document IDs that already exist in storage"
+                existing_track_id = (
+                    existing_doc.get("track_id", "") if existing_doc else ""
+                )
+
+                # Create a new record with unique ID for this duplicate attempt
+                dup_record_id = compute_mdhash_id(f"{doc_id}-{track_id}", prefix="dup-")
+                duplicate_docs[dup_record_id] = {
+                    "status": DocStatus.FAILED,
+                    "content_summary": f"[DUPLICATE] Original document: {doc_id}",
+                    "content_length": new_docs.get(doc_id, {}).get("content_length", 0),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "file_path": file_path,
+                    "track_id": track_id,  # Use current track_id for tracking
+                    "error_msg": f"Content already exists. Original doc_id: {doc_id}, Status: {existing_status}",
+                    "metadata": {
+                        "is_duplicate": True,
+                        "original_doc_id": doc_id,
+                        "original_track_id": existing_track_id,
+                    },
+                }
+
+            # Store duplicate records in doc_status
+            if duplicate_docs:
+                await self.doc_status.upsert(duplicate_docs)
+                logger.info(
+                    f"Created {len(duplicate_docs)} duplicate document records with track_id: {track_id}"
                 )
 
         # Filter new_docs to only include documents with unique IDs
